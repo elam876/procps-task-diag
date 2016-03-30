@@ -196,6 +196,12 @@ typedef struct proc_t {
 #define PROCPATHLEN 64  // must hold /proc/2000222000/task/2000222000/cmdline
 
 typedef struct PROCTAB {
+    int task_diag_fd;
+
+    char task_diag_buf[4096 * 4];
+    struct nlmsghdr *task_diag_hdr;
+    int task_diag_len;
+
     DIR*	procfs;
 //    char deBug0[64];
     DIR*	taskdir;  // for threads

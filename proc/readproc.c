@@ -41,6 +41,9 @@
 #include <systemd/sd-login.h>
 #endif
 
+#include <linux/netlink.h>
+#include "task_diag.h"
+
 // sometimes it's easier to do this manually, w/o gcc helping
 #ifdef PROF
 extern void __cyg_profile_func_enter(void*,void*);
@@ -894,6 +897,7 @@ static const char *lxc_containers (const char *path) {
 	    i < n && l[i] == x;			\
 	} )
 
+static proc_t * task_diag_readproc(PROCTAB *restrict const PT, proc_t *restrict const p);
 //////////////////////////////////////////////////////////////////////////////////
 // This reads process info from /proc in the traditional way, for one process.
 // The pid (tgid? tid?) is already in p, and a path to it in path, with some
@@ -1359,6 +1363,8 @@ end_procs:
 
 //////////////////////////////////////////////////////////////////////////////////
 
+static int task_diag_open(PROCTAB* PT);
+static int task_diag_nextpid(PROCTAB *restrict const PT, proc_t *restrict const p);
 // initiate a process table scan
 PROCTAB* openproc(int flags, ...) {
     va_list ap;
@@ -1374,6 +1380,7 @@ PROCTAB* openproc(int flags, ...) {
     PT->taskdir_user = -1;
     PT->taskfinder = simple_nexttid;
     PT->taskreader = simple_readtask;
+    PT->task_diag_fd = -1;
 
     PT->reader = simple_readproc;
     if (flags & PROC_PID){
@@ -1399,7 +1406,19 @@ PROCTAB* openproc(int flags, ...) {
         src_buffer = xmalloc(MAX_BUFSZ);
         dst_buffer = xmalloc(MAX_BUFSZ);
     }
+
+    if (task_diag_open(PT) == 0) {
+	    PT->finder = task_diag_nextpid;
+	    PT->reader = task_diag_readproc;
+    }
+
     return PT;
+}
+
+static void task_diag_close(PROCTAB *PT)
+{
+	if (PT->task_diag_fd >= 0)
+		close(PT->task_diag_fd);
 }
 
 // terminate a process table scan
@@ -1407,6 +1426,7 @@ void closeproc(PROCTAB* PT) {
     if (PT){
         if (PT->procfs) closedir(PT->procfs);
         if (PT->taskdir) closedir(PT->taskdir);
+	task_diag_close(PT);
         memset(PT,'#',sizeof(PROCTAB));
         free(PT);
     }
@@ -1606,3 +1626,266 @@ proc_t * get_proc_stats(pid_t pid, proc_t *p) {
 #undef MK_THREAD
 #undef IS_THREAD
 #undef MAX_BUFSZ
+
+void *nlmsg_data(const struct nlmsghdr *nlh)
+{
+        return (unsigned char *) nlh + NLMSG_HDRLEN;
+}
+
+int nlmsg_size(int payload)
+{
+        return NLMSG_HDRLEN + payload;
+}
+
+static int nlmsg_msg_size(int payload)
+{
+        return nlmsg_size(payload);
+}
+
+int nlmsg_total_size(int payload)
+{
+        return NLMSG_ALIGN(nlmsg_msg_size(payload));
+}
+
+int nla_attr_size(int payload)
+{
+        return NLA_HDRLEN + payload;
+}
+
+void *nla_data(const struct nlattr *nla)
+{
+        return (char *) nla + NLA_HDRLEN;
+}
+
+int nla_total_size(int payload) 
+{
+        return NLA_ALIGN(nla_attr_size(payload));
+}
+
+#define NLA_DATA(na)         ((void *)((char *)(na) + NLA_HDRLEN))
+
+static int task_diag_open(PROCTAB* PT)
+{
+	struct task_diag_pid *req;
+	char nl_req[4096];
+	struct nlmsghdr *hdr = (void *)nl_req;
+	int fd, err, size;
+
+	hdr->nlmsg_len = nlmsg_total_size(0);
+
+	req = nlmsg_data(hdr);
+	size += nla_total_size(sizeof(*req));
+
+	hdr->nlmsg_len += size;
+
+
+	req->show_flags = TASK_DIAG_SHOW_BASE | TASK_DIAG_SHOW_CRED |
+				TASK_DIAG_SHOW_STAT | TASK_DIAG_SHOW_STATM;
+	req->dump_strategy = TASK_DIAG_DUMP_ALL;
+
+	fd = open("/proc/task-diag", O_RDWR);
+	if (fd < 0)
+		return -1;
+
+	if (write(fd, hdr, hdr->nlmsg_len) != hdr->nlmsg_len)
+		return -1;
+
+	PT->task_diag_fd = fd;
+	PT->task_diag_len = 0;
+	PT->task_diag_hdr = NULL;
+
+	return 0;
+}
+#define pr_err printf
+int nlmsg_receive(PROCTAB *PT, int (*cb)(struct nlmsghdr *, void *), void *args)
+{
+	struct nlmsghdr *hdr;
+	int ret;
+
+	hdr = PT->task_diag_hdr;
+
+	if (hdr->nlmsg_type == NLMSG_DONE) {
+		int *len = (int *)NLMSG_DATA(hdr);
+
+		if (*len < 0) {
+			pr_err("ERROR %d reported by netlink (%s)\n",
+				*len, strerror(-*len));
+			return *len;
+		}
+
+		return 0;
+	}
+
+	if (hdr->nlmsg_type == NLMSG_ERROR) {
+		struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(hdr);
+
+		if (hdr->nlmsg_len - sizeof(*hdr) < sizeof(struct nlmsgerr)) {
+			pr_err("ERROR truncated\n");
+			return -1;
+		}
+
+		if (err->error == 0)
+			return 0;
+
+		return -1;
+	}
+	if (cb) {
+		ret = cb(hdr, args);
+		if (ret < 0)
+			return -1;
+		if (ret > 0)
+			ret = 2;
+		else
+			ret = 1;
+	}
+
+	PT->task_diag_hdr = NLMSG_NEXT(hdr, PT->task_diag_len);
+
+	return ret;
+}
+
+#define PAGE_SIZE (sysconf(_SC_PAGESIZE))
+#define pages_to_kb(a) (a * (PAGE_SIZE >> 10))
+static int show_task(struct nlmsghdr *hdr, void *arg)
+{
+	proc_t *p = arg;
+	int msg_len;
+	struct msgtemplate *msg;
+	struct task_diag_msg *diag_msg;
+	struct nlattr *na;
+	int *last_pid = arg;
+	int len;
+
+	msg_len = NLMSG_PAYLOAD(hdr, 0);
+
+	msg = (struct msgtemplate *)hdr;
+	diag_msg = NLMSG_DATA(msg);
+
+	na = ((void *) diag_msg) + NLMSG_ALIGN(sizeof(*diag_msg));
+	len = NLMSG_ALIGN(sizeof(*diag_msg));
+	while (len < msg_len) {
+		len += NLA_ALIGN(na->nla_len);
+		switch (na->nla_type) {
+		case TASK_DIAG_BASE:
+		{
+			struct task_diag_base *msg;
+
+			/* For nested attributes, na follows */
+			msg = NLA_DATA(na);
+			p->tid = msg->pid;
+			p->tgid = msg->tgid;
+			p->ppid = msg->ppid;
+			p->pgrp = msg->pgid;
+			p->session = msg->sid;
+			strcpy(p->cmd, msg->comm);
+		}
+		break;
+		case TASK_DIAG_CRED:
+		{
+			struct task_diag_creds *creds;
+
+			creds = NLA_DATA(na);
+
+			p->ruid = creds->uid;
+			p->euid = creds->euid;
+			p->suid = creds->suid;
+			p->fuid = creds->fsuid;
+
+			p->rgid = creds->gid;
+			p->egid = creds->egid;
+			p->sgid = creds->sgid;
+			p->fgid = creds->fsgid;
+		}
+		break;
+		case TASK_DIAG_STAT:
+		{
+			struct task_diag_stat *st;
+
+			st = NLA_DATA(na);
+
+			p->min_flt  = st->minflt;
+			p->cmin_flt = st->cminflt;
+			p->maj_flt  = st->majflt;
+			p->cmaj_flt = st->cmajflt;
+
+			p->utime = st->utime;
+			p->stime = st->stime;
+			p->cutime = st->cutime;
+			p->cstime = st->cstime;
+			p->nlwp = st->threads;
+		}
+		break;
+		case TASK_DIAG_STATM:
+		{
+			struct task_diag_statm *st;
+
+			st = NLA_DATA(na);
+
+			p->size		= (st->total_vm);
+			p->resident	= (st->file + st->shmem + st->anon);
+			p->share	= (st->file + st->shmem);
+			p->trs		= (st->text);
+			p->drs		= (st->stack_vm + st->data_vm);
+
+			p->vm_data	= pages_to_kb(st->data_vm);
+			p->vm_exe	= pages_to_kb(st->text);
+			p->vm_lock	= pages_to_kb(st->locked_vm);
+			p->vm_lib	= pages_to_kb(st->lib);
+			p->vm_rss	= pages_to_kb(st->total_rss);
+			p->vm_size	= pages_to_kb(st->total_vm);
+			p->vm_stack	= pages_to_kb(st->stack_vm);
+			p->vm_swap	= pages_to_kb(st->swap);
+		}
+		break;
+		default:
+			printf("Unknown nla_type %d\n",
+				na->nla_type);
+		}
+		na = ((void *) diag_msg) + len;
+	}
+
+	if (diag_msg->flags & TASK_DIAG_FLAG_CONT)
+		return 1;
+
+	return 0;
+}
+
+static proc_t * task_diag_readproc(PROCTAB *restrict const PT, proc_t *restrict const p)
+{
+	int err;
+
+	while (1) {
+		int ret;
+
+		if (!NLMSG_OK(PT->task_diag_hdr, PT->task_diag_len)) {
+			err = read(PT->task_diag_fd, PT->task_diag_buf, sizeof(PT->task_diag_buf));
+			if (err <= 0)
+				return NULL;
+			PT->task_diag_len = err;
+			PT->task_diag_hdr = (struct nlmsghdr *) PT->task_diag_buf;
+		}
+
+		ret = nlmsg_receive(PT, show_task, p);
+		if (!ret)
+			return NULL;
+		if (ret == 1)
+			break;
+	}
+
+	return p;
+}
+
+static int task_diag_nextpid(PROCTAB *restrict const PT, proc_t *restrict const p)
+{
+	if (!NLMSG_OK(PT->task_diag_hdr, PT->task_diag_len)) {
+		int err;
+
+		err = read(PT->task_diag_fd, PT->task_diag_buf, sizeof(PT->task_diag_buf));
+		if (err <= 0)
+			return 0;
+		PT->task_diag_len = err;
+		PT->task_diag_hdr = (struct nlmsghdr *) PT->task_diag_buf;
+	}
+
+	return NLMSG_OK(PT->task_diag_hdr, PT->task_diag_len);
+}
