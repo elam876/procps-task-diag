@@ -1680,7 +1680,8 @@ static int task_diag_open(PROCTAB* PT)
 
 
 	req->show_flags = TASK_DIAG_SHOW_BASE | TASK_DIAG_SHOW_CRED |
-				TASK_DIAG_SHOW_STAT | TASK_DIAG_SHOW_STATM;
+			  TASK_DIAG_SHOW_STAT | TASK_DIAG_SHOW_STATM |
+			  TASK_DIAG_SHOW_CMDLINE;
 	req->dump_strategy = TASK_DIAG_DUMP_ALL;
 
 	fd = open("/proc/task-diag", O_RDWR);
@@ -1766,6 +1767,20 @@ static int show_task(struct nlmsghdr *hdr, void *arg)
 	while (len < msg_len) {
 		len += NLA_ALIGN(na->nla_len);
 		switch (na->nla_type) {
+		case TASK_DIAG_CMDLINE:
+		{
+			char *buf = NLA_DATA(na);
+			int tot = na->nla_len - NLA_HDRLEN;
+			char *rbuf, *i;
+
+			rbuf = malloc(tot + 1);
+			memcpy(rbuf, buf, tot);
+			rbuf[tot] = 0;
+			for (i = rbuf; i < rbuf + tot - 1; i++)
+				if (*i == 0)
+					*i = ' ';
+			p->cmdline = vectorize_this_str(rbuf);
+		}
 		case TASK_DIAG_BASE:
 		{
 			struct task_diag_base *msg;
