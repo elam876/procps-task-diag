@@ -1781,6 +1781,7 @@ static int show_task(struct nlmsghdr *hdr, void *arg)
 					*i = ' ';
 			p->cmdline = vectorize_this_str(rbuf);
 		}
+		break;
 		case TASK_DIAG_BASE:
 		{
 			struct task_diag_base *msg;
