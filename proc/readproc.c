@@ -1678,10 +1678,14 @@ static int task_diag_open(PROCTAB* PT)
 
 	hdr->nlmsg_len += size;
 
-
 	req->show_flags = TASK_DIAG_SHOW_BASE | TASK_DIAG_SHOW_CRED |
-			  TASK_DIAG_SHOW_STAT | TASK_DIAG_SHOW_STATM |
-			  TASK_DIAG_SHOW_CMDLINE;
+			  TASK_DIAG_SHOW_STAT;
+
+	if (PT->flags & PROC_FILLMEM)
+		req->show_flags |= TASK_DIAG_SHOW_STATM;
+	if (PT->flags & PROC_EDITCMDLCVT)
+		req->show_flags |= TASK_DIAG_SHOW_CMDLINE;
+
 	req->dump_strategy = TASK_DIAG_DUMP_ALL;
 
 	fd = open("/proc/task-diag", O_RDWR);
