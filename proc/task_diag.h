@@ -2,6 +2,7 @@
 #define _LINUX_TASK_DIAG_H
 
 #include <linux/types.h>
+#include <bits/sockaddr.h>
 #include <linux/netlink.h>
 #include <linux/capability.h>
 
